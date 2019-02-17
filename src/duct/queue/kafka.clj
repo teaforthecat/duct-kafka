@@ -19,8 +19,6 @@
             [franzy.clients.producer.client :as kp]
             [clojure.core.async :as a]))
 
-(derive :duct.queue/kafka :duct/queue)
-
 (defprotocol Boundary
   (produce
     [conn message]
@@ -149,6 +147,30 @@
     (:consumer conn)
     (update :consumer #((:ctrl %) :resume))))
 
+(defrecord MockConn [chan]
+  Boundary
+  (produce [this message]
+    (produce this message pr-str))
+  (produce [this message serializer]
+    (a/put! chan (serializer message)))
+  (consume [this topic handler]
+    (consume this topic handler read-string))
+  (consume [this topic handler deserializer]
+    (-> (a/alts!! [chan (a/timeout 1000)])
+        first
+        deserializer
+        ;; the real Conn would return a control map
+        handler)))
+
+(defn mock-conn []
+  ;; this pub sub would be almost like kafka, but kafka keeps more than 1000 messages
+  ;; pub (a/pub c :topic (fn [topic] (dropping-buffer 1000)))
+  ;; (a/sub pub topic topic-chan)
+
+  ;; pub sub looks like a lot of work though, and I can't quite work it all
+  ;; out in my head right now. Having only one topic is fine for testing
+  ;; anyway.
+  (->MockConn (a/chan)))
 
 
 
