@@ -120,14 +120,14 @@
   ;; after docker-compose up
   (def options {"bootstrap.servers" "localhost:9092",
                                              :consumer
-                                             {"group.id" "foobar",
+                                             {"group.id" "group123",
                                               "enable.auto.commit" false,
                                               "key.deserializer"
                                               "org.apache.kafka.common.serialization.StringDeserializer",
                                               "value.deserializer"
                                               "org.apache.kafka.common.serialization.StringDeserializer"},
                                              :producer
-                                             {"client.id" "foobar",
+                                             {"client.id" "groupabc",
                                               ;; "enable.idempotence" true,
                                               "key.serializer" "org.apache.kafka.common.serialization.StringSerializer",
                                               "value.serializer" "org.apache.kafka.common.serialization.StringSerializer"}})
@@ -135,9 +135,9 @@
 
   (def conn (ig/init-key :duct.queue/kafka options))
 
-  (produce conn {:topic "abc" :key "12345" :value "xyz"})
-
   (def c  (consume conn ["abc"] println))
+
+  (produce conn {:topic "abc" :key "12345" :value "xyz"})
 
   (ig/halt-key! :duct.queue/kafka c)
 
