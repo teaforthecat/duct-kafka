@@ -18,7 +18,7 @@ In the duct config.edn:
 ### Producing and consuming
 
 Assuming `conn` is managed by duct and setup as a dependency injected into a
-function, then the calls to product and consume would look something like this:
+function, then the calls to produce and consume would look something like this:
 
 ```clojure
 (require '[duct.queue.kafka :as k])

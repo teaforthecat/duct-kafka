@@ -1,166 +1,27 @@
 (ns duct.queue.kafka
-  " Manage a Kafka connection for both producing and consuming.
-
-  When consuming, a message handler is given and offsets are committed after
-  each `poll!`, which may be one or more messages.
-
-  Provides:
-    - integrant keys for fully managing a Kafka connection.
-    - a Boundary protocol with `produce` and `consume` methods.
-    - default serialization via `nippy/freeze` and `nippy/thaw`.
-  "
   (:require [integrant.core :as ig]
-            [taoensso.nippy :as nippy]
-            [franzy.serialization.nippy.serializers :as serializers]
-            [franzy.serialization.nippy.deserializers :as deserializers]
-            [franzy.clients.consumer.client :as kc]
-            [franzy.clients.consumer.protocols :refer [poll! subscribe-to-partitions! commit-offsets-async!]]
-            [franzy.clients.producer.protocols :refer [send-sync!]]
-            [franzy.clients.producer.client :as kp]
-            [clojure.core.async :as a]))
+            [clojure.java.io :as io])
+  (:import [org.apache.kafka.clients
+            producer.KafkaProducer
+            producer.ProducerRecord
+            consumer.KafkaConsumer
+            consumer.ConsumerRecord]))
 
 (defprotocol Boundary
   (produce
-    [conn message]
-    [conn message serializer])
+    [conn message])
   (consume
-    [conn topic handler]
-    [conn topic handler deserializer]))
-
-(defn ser [msg serializer]
-  (-> msg
-      (update :key serializer)
-      (update :value serializer)))
-
-(defn deser [msg serializer]
-  (-> msg
-      (update :key serializer)
-      (update :value serializer)))
-
-(defn make-producer [opts]
-  (kp/make-producer (merge {:value.serializer "org.apache.kafka.common.serialization.ByteArraySerializer"
-                            :key.serializer "org.apache.kafka.common.serialization.ByteArraySerializer"}
-                           opts)))
-
-(defn make-consumer [opts]
-  ;; bug in kc/make-consumer should be config-codec/encode instead of config-codec/decode,
-  ;; so to avoid that we need to pass 3 or 4 args
-  (kc/make-consumer opts
-                    (org.apache.kafka.common.serialization.ByteArrayDeserializer.)
-                    (org.apache.kafka.common.serialization.ByteArrayDeserializer.)
-                    {}))
-
-(defn consume-thread
-  "Consume a Kafka topic or topics from a designated thread.
-  `cnsmr` is the result of `kc/make-consumer`
-  `topic` can be a string for a single topic or a vector of strings for multiple topics
-  `f` will be applied to each message (after deserializer)
-  `deserializer` allows a default serialization to be used
-
-  Returns a map with control functions as values
-  Usage:
-  ((:ctrl c) :pause)
-  ((:ctrl c) :resume)
-  ((:ctrl c) :halt)
-  (a/close! (:thread c))
-
-  "
-  [cnsmr topic f deserializer]
-  (let [c cnsmr
-        state (atom :continue)
-        ;;              state    event  new state
-        state-machine {:continue {:pause :pausing
-                                  :halt :halting}
-                       :pausing {:paused :paused}
-                       :paused {:resume :resuming
-                                :halt :halting}
-                       :resuming {:continue :continue}
-                       :halting {:halt :halted}}
-        step-state (fn [transition]
-                     (swap! state #(get-in state-machine [% transition])))
-        ;; a string means single topic, a vector of strings means multiple topics
-        _ (subscribe-to-partitions! c (if (string? topic) [topic] topic))
-        thread (a/go
-                 (loop []
-                   (case @state
-                     :continue
-                     (do
-                       (doseq [m (poll! c)]
-                         (f (deser m deserializer)))
-                       (commit-offsets-async! c))
-                     :paused
-                     (Thread/sleep 0.1)
-                     :pausing
-                     (do
-                       (.pause! c
-                                (.assigned-partitions c))
-                       (step-state :paused))
-                     :resuming
-                     (do
-                       (.resume! c (.assigned-partitions c))
-                       (step-state :continue))
-                     :halting
-                     (do
-                       (.close c)
-                       (step-state :halt)))
-                   (when (not= :halted @state)
-                     (recur))))]
-
-    {:state state
-     :thread thread
-     :ctrl step-state
-     :consumer c}))
-
-(defrecord Conn [producer make-consumer-fn]
-  Boundary
-  (produce [this message]
-    (produce this message nippy/freeze))
-  (produce [this message serializer]
-    (send-sync! (:producer this) (ser message serializer)))
-  (consume [this topic handler]
-    (consume this topic handler nippy/thaw))
-  (consume [this topic handler deserializer]
-    (let [c ((:make-consumer-fn this))]
-      (consume-thread c topic handler deserializer))))
-
-
-(defmethod ig/init-key :duct.queue.kafka/conn [_ opts]
-  (->Conn (make-producer opts)
-          (fn [] (make-consumer opts))))
-
-(defmethod ig/halt-key! :duct.queue.kafka/conn [_ conn]
-  (cond-> conn
-    (:producer conn)
-    (update :producer #(do (.close %) %))
-    (:consumer conn)
-    (update :consumer #(do ((:ctrl %) :halt)
-                           (a/close! (:thread %))
-                           %))))
-
-(defmethod ig/suspend-key! :duct.queue.kafka/conn [_ conn]
-  (cond-> conn
-    (:consumer conn)
-    (update :consumer #((:ctrl %) :pause))))
-
-(defmethod ig/resume-key :duct.queue.kafka/conn [_ conn _ _]
-  (cond-> conn
-    (:consumer conn)
-    (update :consumer #((:ctrl %) :resume))))
+    [conn topic handler]))
 
 (defrecord MockConn [chan]
   Boundary
   (produce [this message]
-    (produce this message pr-str))
-  (produce [this message serializer]
-    (a/put! chan (serializer message)))
+    (swap! chan conj message))
   (consume [this topic handler]
-    (consume this topic handler read-string))
-  (consume [this topic handler deserializer]
-    (-> (a/alts!! [chan (a/timeout 1000)])
-        first
-        deserializer
-        ;; the real Conn would return a control map
-        handler)))
+    (add-watch chan :consumer (fn [_ _ _ new]
+                                (-> new
+                                    first
+                                    handler)))))
 
 (defn mock-conn []
   ;; this pub sub would be almost like kafka, but kafka keeps more than 1000 messages
@@ -170,31 +31,115 @@
   ;; pub sub looks like a lot of work though, and I can't quite work it all
   ;; out in my head right now. Having only one topic is fine for testing
   ;; anyway.
-  (->MockConn (a/chan)))
+  (->MockConn (atom [])))
 
+
+
+(defn consume-thread
+  "Consume a Kafka topic or topics from a designated thread.
+  `consumer-options` is the key value config pairs for KafkaConsumer
+  `topics` can be a string for a single topic or a vector of strings for multiple topics
+  `handler` will be applied to each message
+
+  Returns a map with a function to close the consumer which will also exit the thread
+  when the closing is complete
+  "
+  [consumer topics handler]
+  (let [continue (atom true)
+        poll-wait (java.time.Duration/ofMillis 1000)
+        _ (.subscribe consumer topics)
+        thread (Thread. (fn []
+                          (loop []
+                            (if @continue
+                              (do
+                                ; this do block is where we ensure that offsets aren't
+                                ; committed until the handler handles each
+                                (doseq [^ConsumerRecord record (.poll consumer poll-wait)]
+                                  (handler {:topic (.topic record)
+                                            :key (.key record)
+                                            :value (.value record)
+                                            :offset (.offset record)}))
+
+                                (.commitSync consumer)
+                                (recur))
+                              (.close consumer)))))
+        close-fn (fn []
+                   (reset! continue false)
+                   ;; wait for processing to finish before returning as a
+                   ;; precaution
+                   (.join thread))]
+    (.start thread)
+    {:close-fn close-fn}))
+
+;; todo add admin
+(defrecord Conn [^KafkaProducer producer ^KafkaConsumer consumer]
+  Boundary
+  (produce [this message]
+    (let [{:keys [topic key value]} message
+          record (ProducerRecord. topic key value)
+          ;; we want to be sure the message was received, so block.
+          ;; psuedo-async can be configured with "acks" 0
+          ;; (this could be turned into an option though)
+          result @(.send producer record)]
+      {:topic (.topic result)
+       :partition (.partition result)
+       :offset (.offset result)
+       :timestamp (.timestamp result)}))
+  (consume [this topics handler]
+    (assoc this :consuming-thread
+           (consume-thread consumer topics handler))))
+
+(defn props
+  "clojure map to java Properties.
+  Map should have strings as keys and string,int,boolean as values"
+  [m]
+  (let [props (java.util.Properties.)]
+    (doseq [p m]
+      (.put props (key p) (val p)))
+    props))
+
+(defmethod ig/init-key :duct.queue/kafka [_ options]
+  (let [p-opts (merge (dissoc options :consumer :producer) (:producer options))
+        c-opts (merge (dissoc options :consumer :producer) (:consumer options))
+        producer (KafkaProducer. (props p-opts))
+        consumer (KafkaConsumer. (props c-opts))]
+    (map->Conn {:producer producer :consumer consumer})))
+
+(defmethod ig/halt-key! :duct.queue/kafka [_ conn]
+  (cond-> conn
+    (:producer conn)
+    (update :producer #(do (.close %) %))
+    (:consuming-thread conn)
+    ;; closes the consumer and sets :consuming-thread to nil
+    (update :consuming-thread #((:close-fn %)))))
 
 
 (comment
 
 
-  ;; start services with docker-compose up
+  ;; after docker-compose up
+  (def options {"bootstrap.servers" "localhost:9092",
+                                             :consumer
+                                             {"group.id" "foobar",
+                                              "enable.auto.commit" false,
+                                              "key.deserializer"
+                                              "org.apache.kafka.common.serialization.StringDeserializer",
+                                              "value.deserializer"
+                                              "org.apache.kafka.common.serialization.StringDeserializer"},
+                                             :producer
+                                             {"client.id" "foobar",
+                                              ;; "enable.idempotence" true,
+                                              "key.serializer" "org.apache.kafka.common.serialization.StringSerializer",
+                                              "value.serializer" "org.apache.kafka.common.serialization.StringSerializer"}})
 
-  (def conn
-    (ig/init-key :duct.queue.kafka/conn {:bootstrap.servers "localhost:9092"
-                                         :group.id "abc"}))
 
-  (def c
-    (consume conn
-             "queue-123"
-             println))
+  (def conn (ig/init-key :duct.queue/kafka options))
 
-  (produce conn {:key :hello :value "world" :topic "queue-123"})
-  ;; see consumer record in repl
+  (produce conn {:topic "abc" :key "12345" :value "xyz"})
 
+  (def c  (consume conn ["abc"] println))
 
-  ((:ctrl c) :pause)
-  ((:ctrl c) :resume)
-  ((:ctrl c) :halt)
-  (a/close! (:thread c))
+  (ig/halt-key! :duct.queue/kafka c)
+
 
   )
